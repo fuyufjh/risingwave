@@ -399,8 +399,8 @@ where
         ctx: &mut CreateMaterializedViewContext,
         actor_id_offset: u32,
         actor_id_len: u32,
-        table_id_offset: u32,
-        table_id_len: u32,
+        table_ids_map: &HashMap<u64, u32>,
+        start_table_id: u32,
     ) -> Result<HashMap<LocalFragmentId, Vec<StreamActor>>> {
         let mut graph = HashMap::new();
 
@@ -425,8 +425,8 @@ where
                 &mut upstream_actors,
                 builder.get_fragment_id(),
                 builder.get_parallel_degree(),
-                table_id_offset,
-                table_id_len,
+                table_ids_map,
+                start_table_id,
             )?);
 
             graph
@@ -468,8 +468,8 @@ where
         upstream_actor_id: &mut HashMap<u64, OrderedActorLink>,
         fragment_id: LocalFragmentId,
         parallel_degree: u32,
-        table_id_offset: u32,
-        table_id_len: u32,
+        table_ids_map: &HashMap<u64, u32>,
+        start_table_id: u32,
     ) -> Result<StreamNode> {
         match stream_node.get_node()? {
             Node::ExchangeNode(_) => {
@@ -489,7 +489,10 @@ where
                     .as_mut()
                     .ok_or(ProstFieldNotFound("prost stream node field not found"))?
                 {
-                    let left_table_id = (ctx.next_local_table_id + table_id_offset) as u64;
+                    // The operator id must be assigned with table ids. Otherwise it is a logic
+                    // error.
+                    let left_table_id =
+                        table_ids_map.get(&new_stream_node.operator_id).unwrap() + start_table_id;
                     let right_table_id = left_table_id + 1;
                     node.left_table_ref_id = Some(TableRefId {
                         table_id: left_table_id as i32,
@@ -499,9 +502,7 @@ where
                         table_id: right_table_id as i32,
                         ..Default::default()
                     });
-                    ctx.next_local_table_id += 2;
                 }
-                assert!(ctx.next_local_table_id <= table_id_len);
                 for (idx, input) in stream_node.input.iter().enumerate() {
                     match input.get_node()? {
                         Node::ExchangeNode(_) => {
@@ -538,8 +539,8 @@ where
                                 upstream_actor_id,
                                 fragment_id,
                                 parallel_degree,
-                                table_id_offset,
-                                table_id_len,
+                                table_ids_map,
+                                start_table_id,
                             )?;
                         }
                     }

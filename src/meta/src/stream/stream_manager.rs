@@ -57,8 +57,6 @@ pub struct CreateMaterializedViewContext {
     pub chain_upstream_assignment: HashMap<FragmentId, Vec<ActorId>>,
     /// Consistent hash mapping, used in hash dispatcher.
     pub hash_mapping: Vec<ParallelUnitId>,
-    /// Used for allocating internal table ids.
-    pub next_local_table_id: u32,
     /// TODO: remove this when we deprecate Java frontend.
     pub is_legacy_frontend: bool,
 }

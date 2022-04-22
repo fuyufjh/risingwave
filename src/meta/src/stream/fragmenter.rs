@@ -52,6 +52,16 @@ pub struct StreamFragmenter<S> {
     /// local actor id
     next_local_actor_id: u32,
 
+    /// Next local table id to be allocated. It equals to total table ids cnt when finish stream
+    /// node traversing.
+    next_local_table_id: u32,
+
+    /// Table id map. operator id -> table id.
+    /// This map will be dynamically inserted when allocate local table id. For operators need 2
+    /// table ids, (e.g. HashJoin), only record the left table id (right table id = left table
+    /// id + 1). If you need to apply relation states to stateful op, should insert into this map.
+    table_ids_map: HashMap<u64, u32>,
+
     /// rewrite will produce new operators, and we need to track next operator id
     next_operator_id: u32,
 
@@ -86,6 +96,8 @@ where
             fragment_actors: HashMap::new(),
             parallel_degree,
             is_legacy_frontend,
+            next_local_table_id: 0,
+            table_ids_map: HashMap::new(),
         }
     }
 
@@ -124,28 +136,19 @@ where
             .generate_interval::<{ IdCategory::Actor }>(actor_len as i32)
             .await? as _;
 
-        // Compute how many table ids should be allocated for all actors.
-        let mut table_ids_cnt = 0;
-        for (local_fragment_id, fragment) in self.fragment_graph.fragments() {
-            let num_of_actors = self
-                .fragment_actors
-                .get(local_fragment_id)
-                .expect("Fragment should have at least one actor")
-                .len();
-            // Total table ids number equals to table ids cnt in all actors.
-            table_ids_cnt += num_of_actors * fragment.table_ids_cnt;
-        }
+        // Allocate all needed table ids for current MV.
+        let table_ids_len = self.next_local_table_id;
         let start_table_id = self
             .id_gen_manager
-            .generate_interval::<{ IdCategory::Table }>(table_ids_cnt as i32)
+            .generate_interval::<{ IdCategory::Table }>(table_ids_len as i32)
             .await? as _;
 
         let stream_graph = self.stream_graph.build(
             ctx,
             start_actor_id,
             actor_len,
+            &self.table_ids_map,
             start_table_id,
-            table_ids_cnt as u32,
         )?;
 
         // Serialize the graph
@@ -279,7 +282,10 @@ where
         // For HashJoin nodes, attempting to rewrite to delta joins only on inner join
         // with only equal conditions
         if let Node::HashJoinNode(hash_join_node) = stream_node.get_node()? {
-            current_fragment.table_ids_cnt += 2;
+            self.table_ids_map
+                .entry(stream_node.operator_id)
+                .or_insert(self.next_local_table_id);
+            self.next_local_table_id += 2;
             if hash_join_node.is_delta_join {
                 if hash_join_node.get_join_type()? == JoinType::Inner
                     && hash_join_node.condition.is_none()
