@@ -26,6 +26,7 @@ use super::iterator::{
     BoxedForwardHummockIterator, ConcatIterator, DirectedUserIterator, MergeIterator,
     ReverseConcatIterator, ReverseMergeIterator, ReverseUserIterator, UserIterator,
 };
+use super::shared_buffer::shared_buffer_batch::SharedBufferBatch;
 use super::utils::{validate_epoch, validate_table_key_range};
 use super::{HummockStorage, ReverseSSTableIterator, SSTableIterator};
 use crate::error::StorageResult;
@@ -46,13 +47,12 @@ impl HummockStorage {
         R: RangeBounds<B> + Send,
         B: AsRef<[u8]> + Send,
     {
-        let (version, shared_buffer) = self
-            .local_version_manager
-            .get_version_and_shared_buffer(&key_range, epoch, reversed)?;
+        let read_version = self.local_version_manager.read_version()?;
+        let pinned_version = read_version.pinned_version;
 
         // Check epoch validity
-        validate_epoch(version.safe_epoch(), epoch)?;
-        let levels = version.levels();
+        validate_epoch(pinned_version.safe_epoch(), epoch)?;
+        let levels = pinned_version.levels();
         validate_table_key_range(&levels)?;
 
         // if `reverse` is true, use `overlapped_backward_sstable_iters`, otherwise use
@@ -61,27 +61,23 @@ impl HummockStorage {
         let mut overlapped_backward_iters = vec![];
 
         // Generate shared buffer iterators
-        if reversed {
-            for batch in shared_buffer {
-                overlapped_backward_iters
-                    .push(Box::new(batch.into_backward_iter()) as BoxedBackwardHummockIterator)
+        for shared_buffer in read_version.shared_buffer.into_iter() {
+            for batch in shared_buffer.get_overlap_batches(&key_range, reversed) {
+                if reversed {
+                    overlapped_backward_iters
+                        .push(Box::new(batch.into_backward_iter()) as BoxedBackwardHummockIterator)
+                } else {
+                    overlapped_forward_iters
+                        .push(Box::new(batch.into_forward_iter()) as BoxedForwardHummockIterator)
+                }
             }
-        } else {
-            for batch in shared_buffer {
-                overlapped_forward_iters
-                    .push(Box::new(batch.into_forward_iter()) as BoxedForwardHummockIterator)
-            }
+            // Release shared buffer read lock
+            drop(shared_buffer);
         }
 
         // Generate iterators for uncommitted ssts by filter out ssts that do not overlap with given
         // `key_range`
-        let table_ids = prune_ssts(
-            version
-                .uncommitted_ssts()
-                .get_sst_iter(version.max_committed_epoch() + 1),
-            &key_range,
-            reversed,
-        );
+        let table_ids = prune_ssts(read_version.uncommitted_ssts.iter(), &key_range, reversed);
         let tables = self.sstable_store.sstables(&table_ids).await?;
         for table in tables.into_iter().rev() {
             if reversed {
@@ -98,7 +94,7 @@ impl HummockStorage {
 
         // Generate iterators for versioned ssts by filter out ssts that do not overlap with given
         // `key_range`
-        for level in &levels {
+        for level in levels {
             let table_ids = prune_ssts(level.get_table_infos().iter(), &key_range, reversed);
             if table_ids.is_empty() {
                 continue;
@@ -160,7 +156,7 @@ impl HummockStorage {
                     key_range.start_bound().map(|b| b.as_ref().to_owned()),
                 ),
                 epoch,
-                Some(version.pinned_version()),
+                Some(pinned_version),
             ))
         } else {
             let merge_iterator = MergeIterator::new(overlapped_forward_iters, self.stats.clone());
@@ -172,7 +168,7 @@ impl HummockStorage {
                     key_range.end_bound().map(|b| b.as_ref().to_owned()),
                 ),
                 epoch,
-                Some(version.pinned_version()),
+                Some(pinned_version),
             ))
         };
 
@@ -194,38 +190,34 @@ impl StateStore for HummockStorage {
     /// failed due to other non-EOF errors.
     fn get<'a>(&'a self, key: &'a [u8], epoch: u64) -> Self::GetFuture<'_> {
         async move {
-            let (version, shared_buffer) = self
-                .local_version_manager
-                .get_version_and_shared_buffer(&(key..=key), epoch, false)?;
+            let read_version = self.local_version_manager.read_version()?;
+            let pinned_version = read_version.pinned_version;
 
             // check epoch validity
-            validate_epoch(version.safe_epoch(), epoch)?;
+            validate_epoch(pinned_version.safe_epoch(), epoch)?;
 
             // Query shared buffer. Return the value without iterating SSTs if found
-            for batch in shared_buffer {
-                if batch.start_user_key() > key {
-                    continue;
-                }
-                match batch.get(key) {
-                    Some(v) => {
-                        self.stats.get_shared_buffer_hit_counts.inc();
-                        return Ok(v.into_user_value().map(|v| v.into()));
+            for shared_buffer in read_version.shared_buffer.into_iter() {
+                for batch in shared_buffer.get_overlap_batches(&(key..=key), false) {
+                    if batch.start_user_key() > key {
+                        continue;
                     }
-                    None => continue,
+                    match batch.get(key) {
+                        Some(v) => {
+                            self.stats.get_shared_buffer_hit_counts.inc();
+                            return Ok(v.into_user_value().map(|v| v.into()));
+                        }
+                        None => continue,
+                    }
                 }
+                drop(shared_buffer)
             }
 
             let mut table_counts = 0;
             let internal_key = key_with_epoch(key.to_vec(), epoch);
 
             // Query uploaded but uncommitted SSTs. Return the value if found.
-            let table_ids = prune_ssts(
-                version
-                    .uncommitted_ssts()
-                    .get_sst_iter(version.max_committed_epoch() + 1),
-                &(key..=key),
-                false,
-            );
+            let table_ids = prune_ssts(read_version.uncommitted_ssts.iter(), &(key..=key), false);
             let tables = self.sstable_store.sstables(&table_ids).await?;
             for table in tables.into_iter().rev() {
                 table_counts += 1;
@@ -234,7 +226,7 @@ impl StateStore for HummockStorage {
                 }
             }
 
-            for level in &version.levels() {
+            for level in pinned_version.levels() {
                 if level.table_infos.is_empty() {
                     continue;
                 }
@@ -331,25 +323,28 @@ impl StateStore for HummockStorage {
         epoch: u64,
     ) -> Self::IngestBatchFuture<'_> {
         async move {
-            let batch = kv_pairs
-                .into_iter()
-                .map(|(key, value)| {
-                    (
-                        Bytes::from(FullKey::from_user_key(key.to_vec(), epoch).into_inner()),
-                        value.into(),
-                    )
-                })
-                .collect_vec();
+            let batch = SharedBufferBatch::new(
+                kv_pairs
+                    .into_iter()
+                    .map(|(key, value)| {
+                        (
+                            Bytes::from(FullKey::from_user_key(key.to_vec(), epoch).into_inner()),
+                            value.into(),
+                        )
+                    })
+                    .collect_vec(),
+                epoch,
+            );
+            let size = batch.size();
 
-            let batch_size = self
-                .shared_buffer_manager()
-                .write_batch(batch, epoch)
+            self.local_version_manager
+                .write_shared_buffer(epoch, batch, false)
                 .await?;
 
             if !self.options.async_checkpoint_enabled {
-                self.shared_buffer_manager().sync(Some(epoch)).await?;
+                self.local_version_manager().sync_shared_buffer(Some(epoch)).await?;
             }
-            Ok(batch_size)
+            Ok(size)
         }
     }
 
@@ -360,17 +355,22 @@ impl StateStore for HummockStorage {
         epoch: u64,
     ) -> Self::ReplicateBatchFuture<'_> {
         async move {
-            let batch = kv_pairs
-                .into_iter()
-                .map(|(key, value)| {
-                    (
-                        Bytes::from(FullKey::from_user_key(key.to_vec(), epoch).into_inner()),
-                        value.into(),
-                    )
-                })
-                .collect_vec();
-            self.shared_buffer_manager()
-                .replicate_remote_batch(batch, epoch)?;
+            let batch = SharedBufferBatch::new(
+                kv_pairs
+                    .into_iter()
+                    .map(|(key, value)| {
+                        (
+                            Bytes::from(FullKey::from_user_key(key.to_vec(), epoch).into_inner()),
+                            value.into(),
+                        )
+                    })
+                    .collect_vec(),
+                epoch,
+            );
+
+            self.local_version_manager
+                .write_shared_buffer(epoch, batch, true)
+                .await?;
 
             Ok(())
         }
@@ -402,7 +402,9 @@ impl StateStore for HummockStorage {
 
     fn sync(&self, epoch: Option<u64>) -> Self::SyncFuture<'_> {
         async move {
-            self.shared_buffer_manager().sync(epoch).await?;
+            self.local_version_manager()
+                .sync_shared_buffer(epoch)
+                .await?;
             Ok(())
         }
     }

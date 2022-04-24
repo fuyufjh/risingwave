@@ -14,244 +14,61 @@
 
 use std::collections::BTreeMap;
 use std::ops::RangeBounds;
-use std::sync::Arc;
 
-use itertools::Itertools;
-use parking_lot::{Mutex, RwLock};
-use risingwave_common::config::StorageConfig;
-use risingwave_hummock_sdk::HummockEpoch;
-use risingwave_rpc_client::HummockMetaClient;
-use tokio::sync::mpsc::UnboundedReceiver;
-use tokio::sync::{mpsc, oneshot};
-use tokio::task::JoinHandle;
-
-use super::shared_buffer_batch::{SharedBufferBatch, SharedBufferItem};
-use super::shared_buffer_uploader::{SharedBufferUploader, UploadItem};
-use crate::hummock::local_version_manager::LocalVersionManager;
+use super::shared_buffer_batch::SharedBufferBatch;
 use crate::hummock::utils::range_overlap;
-use crate::hummock::{HummockError, HummockResult, SstableStoreRef};
-use crate::monitor::StateStoreMetrics;
 
-/// `{ end key -> batch }`
-pub type EpochSharedBuffer = BTreeMap<Vec<u8>, SharedBufferBatch>;
-
-#[derive(Default)]
-pub struct SharedBufferManagerCore {
-    pub buffer: BTreeMap<HummockEpoch, EpochSharedBuffer>,
-    pub size: usize,
+#[derive(Default, Debug)]
+pub struct SharedBuffer {
+    /// `{ end key -> batch }`
+    inner: BTreeMap<Vec<u8>, SharedBufferBatch>,
+    size: u64,
 }
 
-struct SharedBufferUploaderHandle {
-    join_handle: Option<JoinHandle<HummockResult<()>>>,
-    rx: Option<UnboundedReceiver<UploadItem>>,
-}
-
-impl SharedBufferUploaderHandle {
-    fn new(rx: UnboundedReceiver<UploadItem>) -> Self {
-        Self {
-            join_handle: None,
-            rx: Some(rx),
-        }
-    }
-}
-
-pub struct SharedBufferManager {
-    capacity: usize,
-
-    core: Arc<RwLock<SharedBufferManagerCore>>,
-
-    uploader_tx: mpsc::UnboundedSender<UploadItem>,
-    uploader_handle: Mutex<SharedBufferUploaderHandle>,
-}
-
-impl SharedBufferManager {
-    pub fn new(capacity: usize) -> Self {
-        let (uploader_tx, uploader_rx) = mpsc::unbounded_channel();
-        Self {
-            capacity,
-            core: Arc::new(RwLock::new(SharedBufferManagerCore::default())),
-            uploader_tx,
-            uploader_handle: Mutex::new(SharedBufferUploaderHandle::new(uploader_rx)),
-        }
-    }
-
-    pub fn start_uploader(
-        &self,
-        options: Arc<StorageConfig>,
-        local_version_manager: Arc<LocalVersionManager>,
-        sstable_store: SstableStoreRef,
-        stats: Arc<StateStoreMetrics>,
-        hummock_meta_client: Arc<dyn HummockMetaClient>,
-    ) {
-        let mut handle = self.uploader_handle.lock();
-        if let Some(uploader_rx) = handle.rx.take() {
-            let mut uploader = SharedBufferUploader::new(
-                options.clone(),
-                options.shared_buffer_threshold as usize,
-                sstable_store,
-                local_version_manager,
-                hummock_meta_client,
-                self.core.clone(),
-                uploader_rx,
-                stats,
-            );
-            handle.join_handle = Some(tokio::spawn(async move { uploader.run().await }));
-        }
-    }
-
-    pub fn size(&self) -> usize {
-        self.core.read().size
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.size() == 0
-    }
-
-    /// Puts a write batch into shared buffer. The batch will be synced to S3 asynchronously.
-    pub async fn write_batch(
-        &self,
-        items: Vec<SharedBufferItem>,
-        epoch: HummockEpoch,
-    ) -> HummockResult<u64> {
-        let batch = SharedBufferBatch::new(items, epoch);
-        let batch_size = batch.size;
-
-        // TODO: Uncomment the following lines after flushed sstable can be accessed.
-        // FYI: https://github.com/singularity-data/risingwave/pull/1928#discussion_r852698719
-        // Stall writes that attempting to exceeds capacity.
-        // Actively trigger flush, suspend, and wait until some flush completed.
-        // while self.size() + batch_size as usize > self.capacity {
-        //     self.sync(None).await?;
-        // }
-
-        let mut guard = self.core.write();
-        guard
-            .buffer
-            .entry(epoch)
-            .or_insert_with(BTreeMap::default)
+impl SharedBuffer {
+    pub fn write_batch(&mut self, batch: SharedBufferBatch) {
+        self.inner
             .insert(batch.end_user_key().to_vec(), batch.clone());
-        guard.size += batch_size as usize;
-
-        self.uploader_tx
-            .send(UploadItem::Batch(batch))
-            .map_err(HummockError::shared_buffer_error)?;
-
-        Ok(batch_size)
-    }
-
-    /// This function was called while [`SharedBufferManager`] exited.
-    pub async fn wait(self) -> HummockResult<()> {
-        let join_handle = self.uploader_handle.lock().join_handle.take();
-        join_handle.unwrap().await.unwrap()
-    }
-
-    pub async fn sync(&self, epoch: Option<HummockEpoch>) -> HummockResult<()> {
-        if self.is_empty() {
-            return Ok(());
-        }
-
-        let (tx, rx) = oneshot::channel();
-        self.uploader_tx
-            .send(UploadItem::Sync {
-                epoch,
-                notifier: tx,
-            })
-            .map_err(HummockError::shared_buffer_error)?;
-        rx.await.map_err(HummockError::shared_buffer_error)?;
-        Ok(())
+        self.size += batch.size;
     }
 
     // Gets batches from shared buffer that overlap with the given key range.
-    // The returned batches are ordered by epoch desendingly.
     pub fn get_overlap_batches<R, B>(
         &self,
         key_range: &R,
-        epoch_range: impl RangeBounds<u64>,
         reversed_range: bool,
     ) -> Vec<SharedBufferBatch>
     where
         R: RangeBounds<B>,
         B: AsRef<[u8]>,
     {
-        self.core
-            .read()
-            .buffer
-            .range(epoch_range)
-            .rev()
-            .flat_map(|entry| {
-                entry
-                    .1
-                    .range((
-                        if reversed_range {
-                            key_range.end_bound().map(|b| b.as_ref().to_vec())
-                        } else {
-                            key_range.start_bound().map(|b| b.as_ref().to_vec())
-                        },
-                        std::ops::Bound::Unbounded,
-                    ))
-                    .filter(|m| {
-                        range_overlap(
-                            key_range,
-                            m.1.start_user_key(),
-                            m.1.end_user_key(),
-                            reversed_range,
-                        )
-                    })
+        self.inner
+            .range((
+                if reversed_range {
+                    key_range.end_bound().map(|b| b.as_ref().to_vec())
+                } else {
+                    key_range.start_bound().map(|b| b.as_ref().to_vec())
+                },
+                std::ops::Bound::Unbounded,
+            ))
+            .filter(|m| {
+                range_overlap(
+                    key_range,
+                    m.1.start_user_key(),
+                    m.1.end_user_key(),
+                    reversed_range,
+                )
             })
-            .map(|e| e.1.clone())
-            .collect_vec()
+            .map(|entry| entry.1.clone())
+            .collect()
     }
 
-    /// Marks an epoch as committed in shared buffer.
-    /// This will delete shared buffers before a given `epoch` inclusively.
-    pub fn commit_epoch(&self, epoch: HummockEpoch) {
-        let mut guard = self.core.write();
-        // buffer = newer part
-        let mut buffer = guard.buffer.split_off(&(epoch + 1));
-        // buffer = older part, core.buffer = new part
-        std::mem::swap(&mut buffer, &mut guard.buffer);
-        for (_epoch, batches) in buffer {
-            for (_end_user_key, batch) in batches {
-                guard.size -= batch.size as usize
-            }
-        }
+    pub fn delete_batch(&mut self, batch: SharedBufferBatch) -> Option<SharedBufferBatch> {
+        self.inner.remove(batch.end_user_key())
     }
 
-    /// Puts a write batch into shared buffer. The batch won't be synced to S3 asynchronously.
-    pub fn replicate_remote_batch(
-        &self,
-        batch: Vec<SharedBufferItem>,
-        epoch: u64,
-    ) -> HummockResult<()> {
-        let batch = SharedBufferBatch::new(batch, epoch);
-        let batch_size = batch.size as usize;
-        let mut guard = self.core.write();
-        guard
-            .buffer
-            .entry(epoch)
-            .or_insert(BTreeMap::new())
-            .insert(batch.end_user_key().to_vec(), batch.clone());
-        guard.size += batch_size;
-        Ok(())
-    }
-
-    /// Deletes specific batches in shared buffer.
-    /// This method should be invoked after the batches are uploaded to S3.
-    pub fn delete_batches(&self, epoch: u64, batches: Vec<SharedBufferBatch>) {
-        let mut removed_size = 0;
-        let mut guard = self.core.write();
-        let epoch_buffer = guard.buffer.get_mut(&epoch).unwrap();
-        for batch in batches {
-            if let Some(removed_batch) = epoch_buffer.remove(batch.end_user_key()) {
-                removed_size += removed_batch.size as usize;
-            }
-        }
-        guard.size -= removed_size;
-    }
-
-    #[cfg(test)]
-    pub fn get_shared_buffer(&self) -> BTreeMap<u64, EpochSharedBuffer> {
-        self.core.read().buffer.clone()
+    pub fn size(&self) -> u64 {
+        self.size
     }
 }
 

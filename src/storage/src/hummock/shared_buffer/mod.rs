@@ -14,6 +14,6 @@
 
 pub mod shared_buffer_batch;
 #[allow(dead_code)]
-pub mod shared_buffer_manager;
+pub mod shared_buffer;
 #[allow(dead_code)]
 pub mod shared_buffer_uploader;
